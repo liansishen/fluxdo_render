@@ -46,6 +46,7 @@ import 'quote_avatar_handler.dart';
 import 'selectable_text_box.dart';
 import 'spoiler_effect.dart';
 import 'svg_handler.dart';
+import 'render_style.dart';
 
 class NodeFactory {
   NodeFactory({
@@ -370,7 +371,14 @@ class NodeFactory {
     final baseStyle =
         baseTextStyle ?? theme.textTheme.bodyMedium ?? const TextStyle();
     final em = baseStyle.fontSize ?? 14;
-    final headingStyle = headingStyleFor(baseStyle, node.level);
+    final rs = FluxdoRenderStyle.of(context);
+    var headingStyle = headingStyleFor(baseStyle, node.level);
+    if (rs?.headingFontFamily != null || rs?.headingColor != null) {
+      headingStyle = headingStyle.copyWith(
+        fontFamily: rs?.headingFontFamily,
+        color: rs?.headingColor,
+      );
+    }
     final margin = em * kHeadingMargin[node.level - 1];
     // 锚点注册包装:无 HeadingAnchorScope 时(编辑器/分享卡等)零开销,
     // 话题阅读侧借它实现 TOC 跳转与 scroll-spy。
@@ -669,26 +677,30 @@ class NodeFactory {
         pos == BlockquoteChunkPos.whole || pos == BlockquoteChunkPos.first;
     final isLast =
         pos == BlockquoteChunkPos.whole || pos == BlockquoteChunkPos.last;
+    final rs = FluxdoRenderStyle.of(context);
+    final radius = Radius.circular(rs?.quoteRadius ?? 4);
     return Container(
       margin: EdgeInsets.only(top: isFirst ? 8 : 0, bottom: isLast ? 8 : 0),
       padding: EdgeInsets.fromLTRB(12, isFirst ? 8 : 0, 12, isLast ? 8 : 0),
       decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest.withValues(alpha: 0.3),
+        color: rs?.quoteBackground ??
+            scheme.surfaceContainerHighest.withValues(alpha: 0.3),
         border: Border(
           left: BorderSide(
-            color: scheme.outline,
-            width: 4,
+            color: rs?.quoteBarColor ?? scheme.outline,
+            width: rs?.quoteBarWidth ?? 4,
           ),
         ),
         borderRadius: BorderRadius.only(
-          topRight: isFirst ? const Radius.circular(4) : Radius.zero,
-          bottomRight: isLast ? const Radius.circular(4) : Radius.zero,
+          topRight: isFirst ? radius : Radius.zero,
+          bottomRight: isLast ? radius : Radius.zero,
         ),
       ),
       child: DefaultTextStyle.merge(
         style: TextStyle(
-          color: scheme.onSurfaceVariant,
+          color: rs?.quoteTextColor ?? scheme.onSurfaceVariant,
           height: 1.5,
+          fontFamily: rs?.quoteFontFamily,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -715,7 +727,8 @@ class NodeFactory {
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Container(
         height: 1,
-        color: scheme.outlineVariant.withValues(alpha: 0.5),
+        color: FluxdoRenderStyle.of(context)?.ruleColor ??
+            scheme.outlineVariant.withValues(alpha: 0.5),
       ),
     );
   }
@@ -908,16 +921,22 @@ class NodeFactory {
       height: 1.2,
       color: scheme.primary,
     );
+    final rs = FluxdoRenderStyle.of(context);
+    final radius = Radius.circular(rs?.quoteRadius ?? 4);
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 8),
       decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest.withValues(alpha: 0.3),
+        color: rs?.quoteBackground ??
+            scheme.surfaceContainerHighest.withValues(alpha: 0.3),
         border: Border(
-          left: BorderSide(color: scheme.outline, width: 4),
+          left: BorderSide(
+            color: rs?.quoteBarColor ?? scheme.outline,
+            width: rs?.quoteBarWidth ?? 4,
+          ),
         ),
-        borderRadius: const BorderRadius.only(
-          topRight: Radius.circular(4),
-          bottomRight: Radius.circular(4),
+        borderRadius: BorderRadius.only(
+          topRight: radius,
+          bottomRight: radius,
         ),
       ),
       child: Column(
