@@ -31,11 +31,13 @@ import 'package:flutter/foundation.dart';
 import '../../node/node.dart';
 import 'editable_text_content.dart';
 import 'editor_block.dart';
+import 'editor_document_binding.dart';
 import 'inline_markdown_parser.dart';
 import 'inline_spin.dart';
 import 'markdown_serializer.dart';
 
 export 'editor_block.dart';
+export 'editor_document_binding.dart';
 
 /// 编辑器光标/选区:块 id + 块内**编辑文本偏移**(渲染偏移换算在视图层)。
 /// 孤岛块的合法 offset 仅 0(前)/1(后)。
@@ -114,15 +116,22 @@ enum EditorMode {
 /// 历史快照(undo 单元)。
 @immutable
 class _HistoryEntry {
-  const _HistoryEntry({required this.blocks, required this.selection});
+  const _HistoryEntry({required this.blocks, required this.selection,
+    this.documentBindingState});
+
+  final Object? documentBindingState;
 
   final List<EditorBlock> blocks;
   final EditorSelection? selection;
 }
 
+/// A snapshot of the editing location and its text block. Unrelated document
+/// changes must not request scrolling back to a caret the user scrolled away from.
+typedef EditorCaretRevealKey = (EditorSelection?, TextBlock?);
+
 /// 编辑器状态机。
 class EditorState extends ChangeNotifier {
-  EditorState({required List<EditorBlock> blocks})
+  EditorState({required List<EditorBlock> blocks, this.documentBinding})
       : _blocks = List.unmodifiable(
           blocks.any((b) => b is TextBlock)
               ? blocks
@@ -136,6 +145,7 @@ class EditorState extends ChangeNotifier {
                   ),
                 ],
         ) {
+    _documentBindingState = documentBinding?.prepare(null, exportBlocks());
     // id 计数器越过既有 e_N,防碰撞
     for (final b in _blocks) {
       final m = RegExp(r'^e_(\d+)$').firstMatch(b.id);
@@ -160,6 +170,165 @@ class EditorState extends ChangeNotifier {
     );
   }
 
+  /// 绑定在构造时固定，避免既有历史缺少对应语义快照。
+  final EditorDocumentBinding? documentBinding;
+  Object? _documentBindingState;
+
+  /// 与当前正文同步发布的不可变语义快照；无绑定时为 null。
+  Object? get documentBindingState => _documentBindingState;
+
+  _HistoryEntry get _currentHistoryEntry => _HistoryEntry(
+    blocks: _blocks, selection: _selection,
+    documentBindingState: _documentBindingState,
+  );
+
+  /// 原子重写当前及全部历史；不增加 undo 步，也不清空 redo。
+  /// 绑定必须同时给出正文与语义快照，禁止只映射一侧。
+  void remapDocumentHistory(Object operation) {
+    final binding = documentBinding;
+    if (binding is! EditorDocumentHistoryBinding) {
+      throw StateError('当前绑定未实现历史重映射协议');
+    }
+    runAtomicEdit(() {
+      _HistoryEntry map(_HistoryEntry entry) {
+        final mapped = (binding as EditorDocumentHistoryBinding).remapHistory(
+          EditorDocumentHistorySnapshot(entry.blocks, entry.documentBindingState),
+          operation,
+        );
+        final blocks = mapped.blocks;
+        if (!blocks.any((b) => b is TextBlock) ||
+            blocks.map((b) => b.id).toSet().length != blocks.length) {
+          throw StateError('历史映射必须保留文本落点和唯一块 id');
+        }
+        EditorPosition position(EditorPosition old) {
+          final surviving = blocks.where((b) => b.id == old.blockId).firstOrNull;
+          final index = entry.blocks.indexWhere((b) => b.id == old.blockId);
+          final block = surviving ?? blocks[index.clamp(0, blocks.length - 1)];
+          return EditorPosition(blockId: block.id,
+            offset: surviving == null ? 0 : old.offset.clamp(0, block.selectionLength));
+        }
+        final selection = entry.selection;
+        return _HistoryEntry(blocks: blocks,
+          documentBindingState: mapped.documentState,
+          selection: selection == null ? null : EditorSelection(
+            base: position(selection.base), extent: position(selection.extent)));
+      }
+      final current = map(_currentHistoryEntry);
+      final undo = _undoStack.map(map).toList();
+      final redo = _redoStack.map(map).toList();
+      sealHistory();
+      _undoStack..clear()..addAll(undo);
+      _redoStack..clear()..addAll(redo);
+      _blocks = current.blocks;
+      _selection = current.selection;
+      _documentBindingState = current.documentBindingState;
+      _composing = TextRange.empty;
+      _lastEditPos = null;
+      _pendingMarks = null;
+      _pendingAnchor = null;
+      _docRevision++;
+      notifyListeners();
+    });
+  }
+
+  bool _atomicEditActive = false;
+  bool _atomicEditNotified = false;
+  bool _atomicHistoryRecorded = false;
+  bool? _atomicTimerAction;
+
+  /// 同步复合编辑：失败恢复全部编辑状态并原样抛出，成功最多通知一次。
+  /// 嵌套调用加入外层事务，不创建保存点；不要在回调内吞掉编辑异常。
+  /// 每次提交仍调用 binding.prepare，因此不支持的中间态仍可能被拒绝，
+  /// 即使最终状态合法；最终态批量校验留待后续协议扩展。
+  /// 首次历史记录保留既有合组规则，后续提交并入同一步；需要独立 undo
+  /// 时调用方先 sealHistory。无历史提交不会凭空生成历史。不可执行异步
+  /// 编辑、dispose 或依赖可回滚的外部副作用；binding 快照必须不可变。
+  T runAtomicEdit<T>(T Function() edit) {
+    if (_atomicEditActive) return edit();
+    final blocks = _blocks;
+    final selection = _selection;
+    final composing = _composing;
+    final revision = _docRevision;
+    final bindingState = _documentBindingState;
+    final undo = List<_HistoryEntry>.of(_undoStack);
+    final redo = List<_HistoryEntry>.of(_redoStack);
+    final openGroup = _openGroup;
+    final pendingMarks = _pendingMarks;
+    final pendingAnchor = _pendingAnchor;
+    final lastEditPos = _lastEditPos;
+    final idCounter = _idCounter;
+    final mode = _mode;
+    final softBreak = enterInsertsSoftBreak;
+    final callout = pendingCalloutType;
+    final island = _pendingIslandEdit;
+    final reconcile = _irReconcilePending;
+    final reconcileFrom = _pendingIrReconcileFrom;
+    _atomicEditActive = true;
+    _atomicEditNotified = false;
+    _atomicHistoryRecorded = false;
+    _atomicTimerAction = null;
+    late T result;
+    try {
+      result = edit();
+      if (result is Future) {
+        throw StateError('runAtomicEdit 仅接受同步回调');
+      }
+    } catch (_) {
+      _blocks = blocks;
+      _selection = selection;
+      _composing = composing;
+      _docRevision = revision;
+      _documentBindingState = bindingState;
+      _undoStack..clear()..addAll(undo);
+      _redoStack..clear()..addAll(redo);
+      _openGroup = openGroup;
+      _pendingMarks = pendingMarks;
+      _pendingAnchor = pendingAnchor;
+      _lastEditPos = lastEditPos;
+      _idCounter = idCounter;
+      _mode = mode;
+      enterInsertsSoftBreak = softBreak;
+      pendingCalloutType = callout;
+      _pendingIslandEdit = island;
+      _irReconcilePending = reconcile;
+      _pendingIrReconcileFrom = reconcileFrom;
+      _atomicEditActive = false;
+      _atomicEditNotified = false;
+      _atomicHistoryRecorded = false;
+      _atomicTimerAction = null;
+      rethrow;
+    }
+    final notify = _atomicEditNotified;
+    final timerAction = _atomicTimerAction;
+    _atomicEditActive = false;
+    _atomicEditNotified = false;
+    _atomicHistoryRecorded = false;
+    _atomicTimerAction = null;
+    if (timerAction != null) _updateSealTimer(timerAction);
+    if (notify) notifyListeners();
+    return result;
+  }
+
+  @override
+  void notifyListeners() {
+    if (_atomicEditActive) {
+      _atomicEditNotified = true;
+      return;
+    }
+    super.notifyListeners();
+  }
+
+  // 同步回调期间保留原计时器，不取消也不续期。失败因此保留精确的
+  // 原截止时间（含 fake_async）；成功才应用最后一次计时意图。
+  void _updateSealTimer(bool schedule) {
+    if (_atomicEditActive) {
+      _atomicTimerAction = schedule;
+      return;
+    }
+    _sealIdleTimer?.cancel();
+    _sealIdleTimer = schedule ? Timer(_sealIdleDelay, sealHistory) : null;
+  }
+
   List<EditorBlock> _blocks;
   List<EditorBlock> get blocks => _blocks;
 
@@ -176,6 +345,13 @@ class EditorState extends ChangeNotifier {
 
   EditorSelection? _selection;
   EditorSelection? get selection => _selection;
+
+  /// Used by caret scrolling. The block snapshot also detects edits that keep
+  /// the same offset, unlike selection alone.
+  EditorCaretRevealKey get caretRevealKey => (
+    _selection,
+    _selection == null ? null : textBlockById(_selection!.extent.blockId),
+  );
 
   /// 当前块内的 composing 区间(编辑文本坐标),empty = 无。
   TextRange _composing = TextRange.empty;
@@ -222,6 +398,7 @@ class EditorState extends ChangeNotifier {
             ? EditorSelection.collapsed(
                 EditorPosition(blockId: block.id, offset: spun.caret))
             : _selection,
+      intent: const EditorStructureIntent('_foldAllLiterals'),
         groupWithPrevious: false,
         recordHistory: false,
       );
@@ -327,13 +504,16 @@ class EditorState extends ChangeNotifier {
 
   void _recordHistory({required bool groupWithPrevious}) {
     if (groupWithPrevious) {
-      _sealIdleTimer?.cancel();
-      _sealIdleTimer = Timer(_sealIdleDelay, sealHistory);
+      _updateSealTimer(true);
+    }
+    if (_atomicEditActive) {
+      if (_atomicHistoryRecorded) return;
+      _atomicHistoryRecorded = true;
     }
     if (groupWithPrevious && _openGroup && _undoStack.isNotEmpty) {
       return;
     }
-    _undoStack.add(_HistoryEntry(blocks: _blocks, selection: _selection));
+    _undoStack.add(_currentHistoryEntry);
     if (_undoStack.length > _maxHistory) _undoStack.removeAt(0);
     _redoStack.clear();
     _openGroup = groupWithPrevious;
@@ -341,8 +521,7 @@ class EditorState extends ChangeNotifier {
 
   /// 封口当前历史组(composition 结束/结构操作/空闲/点击时调用)。
   void sealHistory() {
-    _sealIdleTimer?.cancel();
-    _sealIdleTimer = null;
+    _updateSealTimer(false);
     _openGroup = false;
   }
 
@@ -359,9 +538,10 @@ class EditorState extends ChangeNotifier {
     if (_undoStack.isEmpty) return;
     sealHistory();
     _clearPending();
-    _redoStack.add(_HistoryEntry(blocks: _blocks, selection: _selection));
+    _redoStack.add(_currentHistoryEntry);
     final entry = _undoStack.removeLast();
     _blocks = entry.blocks;
+    _documentBindingState = entry.documentBindingState;
     _docRevision++;
     // 历史里的选区可能指向已不存在的块/越界偏移,必须 clamp。
     _selection =
@@ -374,9 +554,10 @@ class EditorState extends ChangeNotifier {
     if (_redoStack.isEmpty) return;
     sealHistory();
     _clearPending();
-    _undoStack.add(_HistoryEntry(blocks: _blocks, selection: _selection));
+    _undoStack.add(_currentHistoryEntry);
     final entry = _redoStack.removeLast();
     _blocks = entry.blocks;
+    _documentBindingState = entry.documentBindingState;
     _docRevision++;
     _selection =
         entry.selection == null ? null : _clampSelection(entry.selection!);
@@ -499,6 +680,7 @@ class EditorState extends ChangeNotifier {
             ? EditorSelection.collapsed(
                 EditorPosition(blockId: id, offset: spun.caret))
             : _selection,
+      intent: const EditorStructureIntent('_reconcileLiteralsAfterCaretMove'),
         groupWithPrevious: false,
         recordHistory: false,
       );
@@ -587,6 +769,7 @@ class EditorState extends ChangeNotifier {
       EditorSelection.collapsed(
         EditorPosition(blockId: blockId, offset: materialized.caret),
       ),
+      intent: const EditorStructureIntent('materializeClusterAt'),
       groupWithPrevious: false,
       recordHistory: false,
     );
@@ -599,7 +782,15 @@ class EditorState extends ChangeNotifier {
     if (a.length != b.length) return false;
     final rest = [...b];
     for (final m in a) {
-      if (!rest.remove(m)) return false;
+      if (rest.remove(m)) continue;
+      // 旧调用方未声明来源的自定义标题链接，物化重折叠后会明确为
+      // 显式链接；同名链接已在物化入口排除，这里只允许 null → false。
+      final index = rest.indexWhere((old) =>
+          m.kind == MarkKind.link && old.kind == m.kind &&
+          m.isAutoLink == false && old.isAutoLink == null &&
+          old.start == m.start && old.end == m.end && old.attr == m.attr);
+      if (index < 0) return false;
+      rest.removeAt(index);
     }
     return true;
   }
@@ -652,14 +843,36 @@ class EditorState extends ChangeNotifier {
     required bool groupWithPrevious,
     TextRange composing = TextRange.empty,
     bool recordHistory = true,
+    bool sealBeforeCommit = false,
+    bool clearPendingBeforeCommit = false,
+    EditorStructureIntent? intent,
   }) {
+    // 先在副本上准备语义快照，拒绝必须早于历史、正文和通知。
+    final preparedBlocks = List<EditorBlock>.unmodifiable(
+      _ensureTextBlock(newBlocks),
+    );
+    final binding = documentBinding;
+    final range = normalizedSelection();
+    intent = intent?.withRange(range?.$1.blockId, range?.$1.offset,
+        range?.$2.blockId, range?.$2.offset);
+    final normalized = exportBlocks(fragment: preparedBlocks);
+    final preparedState = binding is EditorDocumentIntentBinding && intent != null
+        ? (binding as EditorDocumentIntentBinding).prepareWithIntent(_documentBindingState, normalized, intent)
+        : binding?.prepare(_documentBindingState, normalized);
+    // 单次提交仍独立校验；复合命令由 runAtomicEdit 提供回滚边界。
+    // 无绑定路径仍由调用方在原位置执行；绑定拒绝不能打断连续输入。
+    if (documentBinding != null) {
+      if (sealBeforeCommit) sealHistory();
+      if (clearPendingBeforeCommit) _clearPending();
+    }
     // recordHistory=false:语义保持变换(光标进入/离开触发的物化/折叠,
     // 文档的**含义**没变只是表示形态变了)不进 undo —— 否则方向键导航
     // 就会污染历史,undo 出一串「格式符时隐时现」的假步骤。
     if (recordHistory) {
       _recordHistory(groupWithPrevious: groupWithPrevious);
     }
-    _blocks = List.unmodifiable(_ensureTextBlock(newBlocks));
+    _blocks = preparedBlocks;
+    _documentBindingState = preparedState;
     _docRevision++;
     _selection = newSelection == null ? null : _clampSelection(newSelection);
     _composing = composing;
@@ -708,9 +921,17 @@ class EditorState extends ChangeNotifier {
 
   /// 折叠光标处插入文本(打字主路径;选区非折叠时先删)。
   void insertText(String inserted) {
+    if (documentBinding != null && !_atomicEditActive) {
+      return runAtomicEdit(() => insertText(inserted));
+    }
     final sanitized = EditableTextContent.sanitizeText(inserted);
     if (sanitized.isEmpty) return;
     if (normalizedSelection() == null) return;
+    // Direct typing/paste and IME replacement share one transaction, including
+    // object endpoints. Deleting first would require two undos to restore them.
+    if (replaceCrossBlockSelection(sanitized, caretOffset: sanitized.length)) {
+      return;
+    }
     if (!(_selection?.isCollapsed ?? true)) {
       deleteSelection();
     }
@@ -741,16 +962,16 @@ class EditorState extends ChangeNotifier {
     // pending marks:命中锚点时对插入区间施加。回车作废 pending(回车
     // 中断格式意图,与光标移动清 pending 同口径)—— 否则 pending 会施
     // 到 `\n` 上,后续打字沿着它延伸,格式凭空跨行。
-    if (hasNewline) {
-      _clearPending();
-    } else if (_pendingMarks != null && _pendingAnchor == pos) {
+    final clearPendingAfterCommit = hasNewline ||
+        (_pendingMarks != null && _pendingAnchor == pos);
+    if (!hasNewline && _pendingMarks != null && _pendingAnchor == pos) {
       content = content.applyExactMarks(
         pos.offset,
         pos.offset + sanitized.length,
         _pendingMarks!,
       );
-      _clearPending();
     }
+    if (documentBinding == null && clearPendingAfterCommit) _clearPending();
     // ir spin:整块重解析(imeReplace 同款,两条打字路径语义必须一致)。
     // 已折叠 mark 与新字面能拼出新结构(em("1") 前后补 `*` → strong);
     // 光标已在字面区外(如物化态闭定界符后)打普通字符 = 离开编辑点,
@@ -764,12 +985,17 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(pos.copyWith(offset: caret)),
+      intent: const EditorStructureIntent('insertText'),
       groupWithPrevious: true,
     );
+    if (documentBinding != null && clearPendingAfterCommit) _clearPending();
   }
 
   /// 折叠光标处插入原子(emoji picker / mention 补全 / 测试)。
   void insertAtom(InlineNode atom) {
+    if (documentBinding != null && !_atomicEditActive) {
+      return runAtomicEdit(() => insertAtom(atom));
+    }
     if (normalizedSelection() == null) return;
     if (!(_selection?.isCollapsed ?? true)) {
       deleteSelection();
@@ -779,7 +1005,7 @@ class EditorState extends ChangeNotifier {
     if (i < 0) return;
     final block = _blocks[i];
     if (block is! TextBlock) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = [..._blocks];
     newBlocks[i] = block.copyWith(
       content: block.content.insertAtom(pos.offset, atom),
@@ -787,6 +1013,8 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(pos.copyWith(offset: pos.offset + 1)),
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('insertAtom'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -810,7 +1038,7 @@ class EditorState extends ChangeNotifier {
     final block = _blocks[i];
     if (block is! TextBlock) return;
     if (!block.content.isAtomAt(offset)) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = [..._blocks];
     newBlocks[i] = block.copyWith(
       content: block.content
@@ -827,9 +1055,35 @@ class EditorState extends ChangeNotifier {
           : EditorSelection.collapsed(
               EditorPosition(blockId: blockId, offset: offset + 1),
             ),
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('replaceAtomAt'),
       groupWithPrevious: false,
     );
     sealHistory();
+  }
+
+  /// 编辑链接原子，保留导入来源；普通 mark 链接仍走原有 IR 路径。
+  bool editLinkAtomAt(String blockId, int offset, {
+    required String text,
+    required String href,
+  }) {
+    final atom = textBlockById(blockId)?.content.atoms[offset];
+    if (atom is! LinkRun) return false;
+    final oldText = EditableTextContent.fromInlines(atom.children).text;
+    replaceAtomAt(blockId, offset, LinkRun(
+      href: href,
+      children: text == oldText ? atom.children : [TextRun(text)],
+      isAttachment: atom.isAttachment,
+      filename: text == oldText ? atom.filename : text,
+      origHref: atom.origHref == null ? null : href,
+      hashtagRef: atom.hashtagRef,
+      hashtagIcon: atom.hashtagIcon,
+      isOneboxLink: atom.isOneboxLink,
+      editorLinkSource: atom.editorLinkSource,
+      editorLinkTitle: atom.editorLinkTitle,
+      editorAngleLink: atom.editorAngleLink && text == href,
+    ), reselect: true);
+    return true;
   }
 
   /// 用 [replacement] 替换 blocks[start..end](**含端点**),单 _commit =
@@ -842,15 +1096,48 @@ class EditorState extends ChangeNotifier {
     EditorSelection? selection,
   }) {
     assert(start >= 0 && end < _blocks.length && start <= end);
-    sealHistory();
-    _clearPending();
+    if (documentBinding == null) {
+      sealHistory();
+      _clearPending();
+    }
     final newBlocks = [
       ..._blocks.sublist(0, start),
       ...replacement,
       ..._blocks.sublist(end + 1),
     ];
-    _commit(newBlocks, selection ?? _selection, groupWithPrevious: false);
+    _commit(newBlocks, selection ?? _selection,
+      sealBeforeCommit: true,
+      clearPendingBeforeCommit: true,
+      intent: EditorStructureIntent('replaceBlockRange', fragment: replacement),
+      groupWithPrevious: false,
+    );
     sealHistory();
+  }
+
+  /// 清理临时任务占位的历史引用，不改变当前正文和用户其他撤销记录。
+  /// 调用方应在正式内容替换临时块之后调用，防止 undo 恢复无主占位。
+  void forgetTransientBlockInHistory(String blockId) {
+    // 不能只改 blocks 留下过期语义历史；绑定未提供历史重映射协议。
+    if (documentBinding != null) {
+      throw const EditorDocumentRejection(
+        '文档绑定尚不支持清理临时块历史',
+        code: 'history_remap_unsupported',
+      );
+    }
+    _HistoryEntry clean(_HistoryEntry entry) {
+      final blocks = entry.blocks.where((block) => block.id != blockId).toList();
+      if (blocks.length == entry.blocks.length) return entry;
+      final selection = entry.selection;
+      return _HistoryEntry(
+        blocks: List.unmodifiable(blocks.isEmpty
+            ? [TextBlock(id: _nextId(), content: EditableTextContent.empty)]
+            : blocks),
+        selection: selection?.base.blockId == blockId || selection?.extent.blockId == blockId
+            ? null : selection,
+      );
+    }
+    for (var i = 0; i < _undoStack.length; i++) { _undoStack[i] = clean(_undoStack[i]); }
+    for (var i = 0; i < _redoStack.length; i++) { _redoStack[i] = clean(_redoStack[i]); }
   }
 
   /// 块 id 发号(结构命令新建块用,与内部序列一致不撞号)。
@@ -860,13 +1147,15 @@ class EditorState extends ChangeNotifier {
   void insertIslandAfter(String blockId, BlockNode node) {
     final i = indexOfBlock(blockId);
     if (i < 0) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final islandId = _nextId();
     final newBlocks = [..._blocks];
     newBlocks.insert(i + 1, IslandBlock(id: islandId, node: node));
     _commit(
       newBlocks,
       EditorSelection.collapsed(EditorPosition(blockId: islandId, offset: 1)),
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('insertIslandAfter'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -943,8 +1232,11 @@ class EditorState extends ChangeNotifier {
         safeStart + replacement.length,
         _pendingMarks!,
       );
-      final composingActive = composing.isValid && !composing.isCollapsed;
-      if (!composingActive) _clearPending();
+      // 绑定时提交成功后清理，门禁拒绝时保留输入意图。
+      if (documentBinding == null &&
+          !(composing.isValid && !composing.isCollapsed)) {
+        _clearPending();
+      }
     }
     final newBlocks = [..._blocks];
     // ir spin(移动端退格主通道:IME 退格不走 backspace(),文本变更全
@@ -966,9 +1258,62 @@ class EditorState extends ChangeNotifier {
       EditorSelection.collapsed(
         EditorPosition(blockId: blockId, offset: caret),
       ),
+      intent: const EditorStructureIntent('imeReplace'),
       groupWithPrevious: true,
       composing: composing,
     );
+    if (documentBinding != null && pendingHit &&
+        replacement.isNotEmpty && !composingActive) {
+      _clearPending();
+    }
+  }
+
+  /// Replaces a cross-block selection as one typing transaction. IME offsets
+  /// here are relative to the inserted string, not its previous input window.
+  bool replaceCrossBlockSelection(String inserted, {
+    required int caretOffset,
+    TextRange composing = TextRange.empty,
+  }) {
+    final selection = _selection;
+    final normalized = normalizedSelection();
+    if (selection == null || selection.isSingleBlock || normalized == null) return false;
+    var (from, to) = normalized;
+    var first = indexOfBlock(from.blockId);
+    var last = indexOfBlock(to.blockId);
+    if (_blocks[first] is IslandBlock && from.offset >= 1) {
+      first++;
+      if (first > last) return false;
+      from = EditorPosition(blockId: _blocks[first].id, offset: 0);
+    }
+    if (_blocks[last] is IslandBlock && to.offset <= 0) {
+      last--;
+      if (last < first) return false;
+      to = EditorPosition(blockId: _blocks[last].id, offset: _blocks[last].selectionLength);
+    }
+    final head = _blocks[first];
+    final tail = _blocks[last];
+    final prefix = head is TextBlock ? head.content.slice(0, from.offset) : EditableTextContent.empty;
+    final suffix = tail is TextBlock ? tail.content.slice(to.offset, tail.content.length) : EditableTextContent.empty;
+    final text = EditableTextContent.sanitizeText(inserted);
+    final merged = prefix.concat(suffix).insert(prefix.length, text);
+    final block = head is TextBlock ? head : tail is TextBlock ? tail : TextBlock(id: _nextId(), content: EditableTextContent.empty);
+    if (documentBinding == null) sealHistory();
+    if (documentBinding == null) _clearPending();
+    _commit([
+      ..._blocks.sublist(0, first),
+      block.copyWith(content: merged),
+      ..._blocks.sublist(last + 1),
+    ], EditorSelection.collapsed(EditorPosition(blockId: block.id, offset: prefix.length + caretOffset.clamp(0, text.length))),
+      sealBeforeCommit: true,
+      clearPendingBeforeCommit: true,
+      intent: const EditorStructureIntent('replaceCrossBlockSelection'),
+      groupWithPrevious: true,
+      composing: composing.isValid ? TextRange(
+        start: prefix.length + composing.start.clamp(0, text.length),
+        end: prefix.length + composing.end.clamp(0, text.length),
+      ) : TextRange.empty,
+    );
+    return true;
   }
 
   /// 删除当前选区(跨块支持;孤岛按端点四象限归一)。
@@ -977,8 +1322,8 @@ class EditorState extends ChangeNotifier {
     if (norm == null) return;
     var (from, to) = norm;
     if (_selection!.isCollapsed) return;
-    sealHistory();
-    _clearPending();
+    if (documentBinding == null) sealHistory();
+    if (documentBinding == null) _clearPending();
 
     var fi = indexOfBlock(from.blockId);
     var ti = indexOfBlock(to.blockId);
@@ -1070,6 +1415,9 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(caret),
+      clearPendingBeforeCommit: true,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('deleteSelection'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -1082,6 +1430,9 @@ class EditorState extends ChangeNotifier {
   /// - 光标在岛上(整选态由 deleteSelection 处理,折叠在岛 offset 上
   ///   理论不出现,防御为选中岛)。
   void backspace() {
+    if (documentBinding != null && !_atomicEditActive) {
+      return runAtomicEdit(() => backspace());
+    }
     final sel = _selection;
     if (sel == null) return;
     if (!sel.isCollapsed) {
@@ -1146,6 +1497,7 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(pos.copyWith(offset: spun.caret)),
+      intent: const EditorStructureIntent('backspace'),
       groupWithPrevious: true,
     );
   }
@@ -1165,6 +1517,9 @@ class EditorState extends ChangeNotifier {
 
   /// 光标后删一个 grapheme(Forward Delete;段尾对岛同样两段式)。
   void deleteForward() {
+    if (documentBinding != null && !_atomicEditActive) {
+      return runAtomicEdit(() => deleteForward());
+    }
     final sel = _selection;
     if (sel == null) return;
     if (!sel.isCollapsed) {
@@ -1203,6 +1558,7 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(pos.copyWith(offset: spun.caret)),
+      intent: const EditorStructureIntent('deleteForward'),
       groupWithPrevious: true,
     );
   }
@@ -1250,6 +1606,9 @@ class EditorState extends ChangeNotifier {
 
   /// 光标处回车分块(属性感知,语义表见计划)。
   void splitBlock() {
+    if (documentBinding != null && !_atomicEditActive) {
+      return runAtomicEdit(() => splitBlock());
+    }
     final sel = _selection;
     if (sel == null) return;
     // 岛整选态回车:不删岛,岛后建空段(Notion 等主流的"选中块回车")。
@@ -1296,7 +1655,7 @@ class EditorState extends ChangeNotifier {
       return;
     }
 
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final (before, after) = block.content.split(pos.offset);
     final newId = _nextId();
 
@@ -1319,6 +1678,7 @@ class EditorState extends ChangeNotifier {
                 kind: b.kind,
                 headingLevel: b.headingLevel,
                 ordered: b.ordered,
+                listLoose: b.listLoose,
                 depth: b.depth,
                 // listStart 只属于 run 首项,分裂出的新项不带
                 containers: b.containers,
@@ -1331,6 +1691,8 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(EditorPosition(blockId: newId, offset: 0)),
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('splitBlock'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -1345,9 +1707,69 @@ class EditorState extends ChangeNotifier {
     _insertParagraphNear(i, after: after);
   }
 
+  /// The trailing writing space represents the next line, even if the current
+  /// last paragraph is empty. It becomes document content only when clicked.
+  void continueAfterDocument() {
+    _insertParagraphNear(_blocks.length - 1, after: true);
+  }
+
+  /// 从对象回到输入：优先使用同行文字或邻段，文档边界才创建空段。
+  void placeCaretBesideObject(
+    String blockId, {
+    int? atomOffset,
+    required bool after,
+  }) {
+    final index = indexOfBlock(blockId);
+    if (index < 0) return;
+    final block = _blocks[index];
+    final offset = (atomOffset ?? 0) + (after ? 1 : 0);
+    if (block is TextBlock &&
+        atomOffset != null &&
+        (after ? offset < block.content.length : offset > 0)) {
+      updateSelection(
+        EditorSelection.collapsed(
+          EditorPosition(blockId: blockId, offset: offset),
+        ),
+      );
+      return;
+    }
+    final neighborIndex = index + (after ? 1 : -1);
+    if (neighborIndex >= 0 &&
+        neighborIndex < _blocks.length &&
+        _blocks[neighborIndex] is TextBlock) {
+      final neighbor = _blocks[neighborIndex] as TextBlock;
+      updateSelection(
+        EditorSelection.collapsed(
+          EditorPosition(
+            blockId: neighbor.id,
+            offset: after ? 0 : neighbor.content.length,
+          ),
+        ),
+      );
+      return;
+    }
+    if (block is IslandBlock) {
+      _insertParagraphNear(index, after: after);
+    } else if (block is TextBlock && atomOffset != null) {
+      updateSelection(
+        EditorSelection.collapsed(
+          EditorPosition(blockId: blockId, offset: offset),
+        ),
+      );
+      splitBlock();
+      if (!after) {
+        updateSelection(
+          EditorSelection.collapsed(
+            EditorPosition(blockId: blockId, offset: 0),
+          ),
+        );
+      }
+    }
+  }
+
   void _insertParagraphNear(int index, {required bool after}) {
     if (index < 0) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newId = _nextId();
     final newBlocks = [..._blocks];
     newBlocks.insert(
@@ -1357,6 +1779,8 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(EditorPosition(blockId: newId, offset: 0)),
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('_insertParagraphNear'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -1370,7 +1794,7 @@ class EditorState extends ChangeNotifier {
     final prev = _blocks[i - 1];
     final cur = _blocks[i];
     if (prev is! TextBlock || cur is! TextBlock) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final joinOffset = prev.content.length;
     final newBlocks = [..._blocks];
     newBlocks[i - 1] = prev.copyWith(content: prev.content.concat(cur.content));
@@ -1380,6 +1804,8 @@ class EditorState extends ChangeNotifier {
       EditorSelection.collapsed(
         EditorPosition(blockId: prev.id, offset: joinOffset),
       ),
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('mergeWithPrevious'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -1419,13 +1845,17 @@ class EditorState extends ChangeNotifier {
     if (i < 0) return;
     final block = _blocks[i];
     if (block is! TextBlock) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = [..._blocks];
     newBlocks[i] = block.copyWith(
       content:
           block.content.toggleMarkInRange(from.offset, to.offset, kind),
     );
-    _commit(newBlocks, sel, groupWithPrevious: false);
+    _commit(newBlocks, sel,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('toggleMark'),
+      groupWithPrevious: false,
+    );
     sealHistory();
   }
 
@@ -1440,13 +1870,18 @@ class EditorState extends ChangeNotifier {
     if (i < 0) return;
     final block = _blocks[i];
     if (block is! TextBlock) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = [..._blocks];
     newBlocks[i] = block.copyWith(
       content: block.content
-          .applyMark(from.offset, to.offset, MarkKind.link, attr: href),
+          .applyMark(from.offset, to.offset, MarkKind.link,
+              attr: href, isAutoLink: false),
     );
-    _commit(newBlocks, _selection, groupWithPrevious: false);
+    _commit(newBlocks, _selection,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('applyLink'),
+      groupWithPrevious: false,
+    );
     sealHistory();
   }
 
@@ -1460,12 +1895,19 @@ class EditorState extends ChangeNotifier {
     if (i < 0) return;
     final block = _blocks[i];
     if (block is! TextBlock) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = [..._blocks];
-    newBlocks[i] = block.copyWith(
-      content: block.content.removeMark(from.offset, to.offset, MarkKind.link),
+    final atom = block.content.atoms[from.offset];
+    final content = atom is LinkRun && to.offset == from.offset + 1
+        ? block.content.delete(from.offset, to.offset).insert(
+            from.offset, EditableTextContent.fromInlines(atom.children).text)
+        : block.content.removeMark(from.offset, to.offset, MarkKind.link);
+    newBlocks[i] = block.copyWith(content: content);
+    _commit(newBlocks, _selection,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('removeLink'),
+      groupWithPrevious: false,
     );
-    _commit(newBlocks, _selection, groupWithPrevious: false);
     sealHistory();
   }
 
@@ -1495,8 +1937,8 @@ class EditorState extends ChangeNotifier {
     final opening = markOpeningDelimiter(mark);
     final closing = markClosingDelimiter(mark);
     if (opening.isEmpty && closing.isEmpty) return; // 覆盖不了的 kind
-    sealHistory();
-    _clearPending();
+    if (documentBinding == null) sealHistory();
+    if (documentBinding == null) _clearPending();
     // 摘掉目标 mark(其余 marks/atoms 原样),再插字面定界符
     var next = EditableTextContent(
       text: content.text,
@@ -1505,6 +1947,7 @@ class EditorState extends ChangeNotifier {
           if (m != mark) m,
       ],
       atoms: content.atoms,
+      softBreaks: content.softBreaks,
     );
     next = next.insert(mark.end, closing);
     next = next.insert(mark.start, opening);
@@ -1520,6 +1963,9 @@ class EditorState extends ChangeNotifier {
       EditorSelection.collapsed(
         EditorPosition(blockId: blockId, offset: caret),
       ),
+      clearPendingBeforeCommit: true,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('materializeMarkAt'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -1540,10 +1986,14 @@ class EditorState extends ChangeNotifier {
   }
 
   void _updateBlockAttrs(int index, TextBlock updated) {
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = [..._blocks];
     newBlocks[index] = updated;
-    _commit(newBlocks, _selection, groupWithPrevious: false);
+    _commit(newBlocks, _selection,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('_updateBlockAttrs'),
+      groupWithPrevious: false,
+    );
     sealHistory();
   }
 
@@ -1551,7 +2001,7 @@ class EditorState extends ChangeNotifier {
   void _mapSelectedTextBlocks(TextBlock Function(TextBlock) f) {
     final range = _selectedTextBlockRange();
     if (range == null) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = [..._blocks];
     var changed = false;
     for (var i = range.$1; i <= range.$2; i++) {
@@ -1565,7 +2015,11 @@ class EditorState extends ChangeNotifier {
       }
     }
     if (!changed) return;
-    _commit(newBlocks, _selection, groupWithPrevious: false);
+    _commit(newBlocks, _selection,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('_mapSelectedTextBlocks'),
+      groupWithPrevious: false,
+    );
     sealHistory();
   }
 
@@ -1673,7 +2127,7 @@ class EditorState extends ChangeNotifier {
   /// 分组身份不变,壳 Element 复用,只有属性变。undo 一步。
   void updateContainerFrame(String groupId, ContainerFrame newFrame) {
     assert(newFrame.groupId == groupId, '保持 groupId 才能不破坏分组');
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = <EditorBlock>[..._blocks];
     var changed = false;
     for (var i = 0; i < newBlocks.length; i++) {
@@ -1687,7 +2141,11 @@ class EditorState extends ChangeNotifier {
       changed = true;
     }
     if (!changed) return;
-    _commit(newBlocks, _selection, groupWithPrevious: false);
+    _commit(newBlocks, _selection,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('updateContainerFrame'),
+      groupWithPrevious: false,
+    );
     sealHistory();
   }
 
@@ -1721,6 +2179,7 @@ class EditorState extends ChangeNotifier {
       _commit(
         newBlocks,
         EditorSelection.collapsed(EditorPosition(blockId: blockId, offset: 0)),
+      intent: const EditorStructureIntent('applyBlockInputRule'),
         groupWithPrevious: false,
       );
       sealHistory();
@@ -1750,6 +2209,7 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(EditorPosition(blockId: newId, offset: 0)),
+      intent: const EditorStructureIntent('applyBlockInputRule'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -1777,6 +2237,7 @@ class EditorState extends ChangeNotifier {
       EditorSelection.collapsed(
         EditorPosition(blockId: blockId, offset: start + 1),
       ),
+      intent: const EditorStructureIntent('applyImageInputRule'),
       groupWithPrevious: false,
     );
   }
@@ -1797,7 +2258,8 @@ class EditorState extends ChangeNotifier {
     final content = block.content
         .delete(start, end)
         .insert(start, label)
-        .applyMark(start, start + label.length, MarkKind.link, attr: href);
+        .applyMark(start, start + label.length, MarkKind.link,
+            attr: href, isAutoLink: false);
     final newBlocks = [..._blocks];
     newBlocks[i] = block.copyWith(content: content);
     _commit(
@@ -1805,6 +2267,7 @@ class EditorState extends ChangeNotifier {
       EditorSelection.collapsed(
         EditorPosition(blockId: blockId, offset: start + label.length),
       ),
+      intent: const EditorStructureIntent('applyLinkInputRule'),
       groupWithPrevious: false,
     );
   }
@@ -1856,6 +2319,7 @@ class EditorState extends ChangeNotifier {
           offset: caretAtEnd ? matchStart + contentLength : matchStart,
         ),
       ),
+      intent: const EditorStructureIntent('applyInlineInputRule'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -1908,14 +2372,16 @@ class EditorState extends ChangeNotifier {
     return out;
   }
 
-  /// 导出当前编辑文档或原坐标切出的片段，不改变正文、选区及撤销栈。
+  /// 导出当前文档或 [fragment] 的只读语义块快照，不经过 Markdown。
   ///
-  /// IR 光标处的格式已物化成源码文本，不能直接当普通正文转义。
-  /// 仅在临时快照中收口；WYSIWYG 的字面 Markdown 保持原序列化语义。
-  String exportMarkdown({List<EditorBlock>? fragment}) {
+  /// IR 仅在快照中关闭光标守卫、折叠完整行内语法；WYSIWYG 不解析
+  /// 字面语法。片段须先按原编辑坐标切出，不扩展范围或补全残缺语法。
+  /// 保留块属性、源码属性及软换行，不改变正文引用、选区、composing、
+  /// 修订、撤销历史，也不发送通知。不可变块可与原文档共享。
+  List<EditorBlock> exportBlocks({List<EditorBlock>? fragment}) {
     final source = fragment ?? _blocks;
-    if (_mode != EditorMode.ir) return docToMarkdown(source);
-    final snapshot = <EditorBlock>[
+    if (_mode != EditorMode.ir) return List.unmodifiable(source);
+    return List<EditorBlock>.unmodifiable([
       for (final block in source)
         if (block is TextBlock)
           block.copyWith(content: spinInlineMarks(
@@ -1927,12 +2393,30 @@ class EditorState extends ChangeNotifier {
           ).content)
         else
           block,
-    ];
-    return docToMarkdown(snapshot);
+    ]);
+  }
+
+  /// 导出当前编辑文档或原坐标切出的片段，不改变编辑状态。
+  String exportMarkdown({List<EditorBlock>? fragment}) {
+    final binding = documentBinding;
+    if (binding is EditorDocumentExportBinding) {
+      return (binding as EditorDocumentExportBinding).exportDocument(
+        _documentBindingState!, fragment: fragment,
+      );
+    }
+    return docToMarkdown(exportBlocks(fragment: fragment));
   }
 
   /// 当前选区 → markdown(系统剪贴板文本;跨 app 粘贴通用格式)。
   String copySelectionAsMarkdown() {
+    final binding = documentBinding;
+    if (binding is EditorDocumentExportBinding) {
+      final selection = _selection;
+      if (selection == null || selection.isCollapsed) return '';
+      return (binding as EditorDocumentExportBinding).exportSelection(
+        _documentBindingState!, selection, blocks: _blocks,
+      );
+    }
     final blocks = copySelectionAsBlocks();
     if (blocks.isEmpty) return '';
     return exportMarkdown(fragment: blocks);
@@ -1946,7 +2430,39 @@ class EditorState extends ChangeNotifier {
   /// - 中间块整块插入(re-id 防碰撞);
   /// - 片段尾块与光标块尾段合并;单块片段=纯内联插入。
   /// - 首/尾块是岛 → 不合并,按整块插入。
+  /// 删除选区与插入片段在隔离状态中计算，一次提交正文和撤销快照。
   void pasteBlocks(List<EditorBlock> fragment) {
+    if (documentBinding != null && !_atomicEditActive) {
+      return runAtomicEdit(() => pasteBlocks(fragment));
+    }
+    if (fragment.isEmpty || normalizedSelection() == null) return;
+    final draft = EditorState(blocks: _blocks);
+    draft._idCounter = _idCounter;
+    draft._selection = _selection;
+    draft._mode = _mode;
+    try {
+      draft._pasteBlocksImpl(fragment);
+      if (documentBinding == null) {
+        _idCounter = draft._idCounter;
+        sealHistory();
+        _clearPending();
+      }
+      _commit(draft._blocks, draft._selection,
+        sealBeforeCommit: true,
+        clearPendingBeforeCommit: true,
+      intent: EditorStructureIntent('pasteBlocks', fragment: exportBlocks(fragment: fragment)),
+        groupWithPrevious: false,
+      );
+      if (documentBinding != null) {
+        _idCounter = draft._idCounter;
+      }
+      sealHistory();
+    } finally {
+      draft.dispose();
+    }
+  }
+
+  void _pasteBlocksImpl(List<EditorBlock> fragment) {
     if (fragment.isEmpty) return;
     if (normalizedSelection() == null) return;
     if (!(_selection?.isCollapsed ?? true)) {
@@ -1977,6 +2493,7 @@ class EditorState extends ChangeNotifier {
         EditorSelection.collapsed(
           EditorPosition(blockId: last.id, offset: last.selectionLength),
         ),
+      intent: const EditorStructureIntent('_pasteBlocksImpl'),
         groupWithPrevious: false,
       );
       sealHistory();
@@ -2002,6 +2519,7 @@ class EditorState extends ChangeNotifier {
         EditorSelection.collapsed(
           pos.copyWith(offset: offset + first.content.length),
         ),
+      intent: const EditorStructureIntent('_pasteBlocksImpl'),
         groupWithPrevious: false,
       );
       sealHistory();
@@ -2052,6 +2570,7 @@ class EditorState extends ChangeNotifier {
         ordered: lastText.ordered,
         depth: lastText.depth,
         listStart: lastText.listStart,
+        listLoose: lastText.listLoose,
         containers: lastText.containers,
       ));
       caret = EditorPosition(blockId: tailId, offset: lastText.content.length);
@@ -2066,6 +2585,7 @@ class EditorState extends ChangeNotifier {
         kind: host.kind,
         headingLevel: host.headingLevel,
         ordered: host.ordered,
+        listLoose: host.listLoose,
         depth: host.depth,
         containers: host.containers,
       ));
@@ -2076,6 +2596,7 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(caret),
+      intent: const EditorStructureIntent('_pasteBlocksImpl'),
       groupWithPrevious: false,
     );
     sealHistory();
@@ -2083,6 +2604,9 @@ class EditorState extends ChangeNotifier {
 
   /// 纯文本粘贴降级(cook 不可用/剪贴板无结构):按换行拆段插入。
   void pastePlainText(String text) {
+    if (documentBinding != null && !_atomicEditActive) {
+      return runAtomicEdit(() => pastePlainText(text));
+    }
     final sanitized = EditableTextContent.sanitizeText(text)
         .replaceAll('\r\n', '\n')
         .replaceAll('\r', '\n');
@@ -2139,6 +2663,7 @@ class EditorState extends ChangeNotifier {
             ordered: tb.ordered,
             depth: tb.depth,
             listStart: tb.listStart,
+            listLoose: tb.listLoose,
             containers: tb.containers,
           ),
         final IslandBlock ib => IslandBlock(id: _nextId(), node: ib.node),
@@ -2207,10 +2732,14 @@ class EditorState extends ChangeNotifier {
   void updateIslandNode(String islandId, BlockNode newNode) {
     final i = indexOfBlock(islandId);
     if (i < 0 || _blocks[i] is! IslandBlock) return;
-    sealHistory();
+    if (documentBinding == null) sealHistory();
     final newBlocks = [..._blocks];
     newBlocks[i] = IslandBlock(id: islandId, node: newNode);
-    _commit(newBlocks, _selection, groupWithPrevious: false);
+    _commit(newBlocks, _selection,
+      sealBeforeCommit: true,
+      intent: const EditorStructureIntent('updateIslandNode'),
+      groupWithPrevious: false,
+    );
     sealHistory();
   }
 
@@ -2221,8 +2750,8 @@ class EditorState extends ChangeNotifier {
   void replaceIsland(String islandId, List<EditorBlock> fragment) {
     final i = indexOfBlock(islandId);
     if (i < 0 || _blocks[i] is! IslandBlock) return;
-    sealHistory();
-    _clearPending();
+    if (documentBinding == null) sealHistory();
+    if (documentBinding == null) _clearPending();
     final newBlocks = [..._blocks];
     newBlocks.removeAt(i);
     if (fragment.isEmpty) {
@@ -2238,6 +2767,9 @@ class EditorState extends ChangeNotifier {
       _commit(
         newBlocks,
         anchor == null ? null : EditorSelection.collapsed(anchor),
+        clearPendingBeforeCommit: true,
+        sealBeforeCommit: true,
+      intent: const EditorStructureIntent('replaceIsland'),
         groupWithPrevious: false,
       );
       sealHistory();
@@ -2251,6 +2783,9 @@ class EditorState extends ChangeNotifier {
       EditorSelection.collapsed(
         EditorPosition(blockId: last.id, offset: last.selectionLength),
       ),
+      sealBeforeCommit: true,
+      clearPendingBeforeCommit: true,
+      intent: const EditorStructureIntent('replaceIsland'),
       groupWithPrevious: false,
     );
     sealHistory();

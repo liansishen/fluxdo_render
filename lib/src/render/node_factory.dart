@@ -44,6 +44,7 @@ import 'chat_transcript_handler.dart';
 import 'poll_handler.dart';
 import 'quote_avatar_handler.dart';
 import 'selectable_text_box.dart';
+import 'selectable_object_block.dart';
 import 'spoiler_effect.dart';
 import 'svg_handler.dart';
 import 'render_style.dart';
@@ -80,10 +81,10 @@ class NodeFactory {
     this.chunkIndex = 0,
     Map<Object, int>? docOrders,
     Map<Object, int>? fallbackDocOrders,
-  })  : _inlineFlattener = inlineFlattener ?? const InlineFlattener(),
-        _docOrders = docOrders ?? const {},
-        // identity:节点/ListItem 是值相等对象,重复内容不得共享兜底序号
-        _fallbackDocOrders = fallbackDocOrders ?? Map<Object, int>.identity();
+  }) : _inlineFlattener = inlineFlattener ?? const InlineFlattener(),
+       _docOrders = docOrders ?? const {},
+       // identity:节点/ListItem 是值相等对象,重复内容不得共享兜底序号
+       _fallbackDocOrders = fallbackDocOrders ?? Map<Object, int>.identity();
 
   final InlineFlattener _inlineFlattener;
 
@@ -271,11 +272,19 @@ class NodeFactory {
     bool trimTop = false,
     bool trimBottom = false,
   }) {
-    return switch (node) {
-      ParagraphNode() =>
-        buildParagraph(context, node, trimTop: trimTop, trimBottom: trimBottom),
-      HeadingNode() =>
-        buildHeading(context, node, trimTop: trimTop, trimBottom: trimBottom),
+    final content = switch (node) {
+      ParagraphNode() => buildParagraph(
+        context,
+        node,
+        trimTop: trimTop,
+        trimBottom: trimBottom,
+      ),
+      HeadingNode() => buildHeading(
+        context,
+        node,
+        trimTop: trimTop,
+        trimBottom: trimBottom,
+      ),
       ListNode() => buildList(context, node),
       BlockquoteNode() => buildBlockquote(context, node),
       HorizontalRuleNode() => buildHorizontalRule(context, node),
@@ -300,6 +309,43 @@ class NodeFactory {
       DefinitionListNode() => buildDefinitionList(context, node),
       SvgNode() => buildSvg(context, node),
     };
+    final objectText = switch (node) {
+      ImageGridNode(:final images) => (
+        text: images.map((image) => image.alt).join('\n'),
+        copy: images
+            .map((image) => image.alt.isEmpty ? image.src : image.alt)
+            .join('\n'),
+      ),
+      LazyVideoNode(:final url) => (text: '', copy: url),
+      IframeNode(:final src) => (text: '', copy: src),
+      VideoNode(:final src) => (text: '', copy: src),
+      AudioNode(:final src) => (text: '', copy: src),
+      OneboxNode(:final title, :final url) => (
+        text: title ?? '',
+        copy: title ?? url ?? '',
+      ),
+      MathBlockNode(:final latex) => (text: latex, copy: latex),
+      SvgNode(:final svgSource) => (text: '', copy: svgSource),
+      HorizontalRuleNode() => (text: '', copy: '---'),
+      PollNode(:final title, :final pollName) => (
+        text: title ?? pollName,
+        copy: title ?? pollName,
+      ),
+      ChatTranscriptNode(:final messagesHtml) => (
+        text: _ChatTranscriptFallbackCard._stripHtml(messagesHtml),
+        copy: _ChatTranscriptFallbackCard._stripHtml(messagesHtml),
+      ),
+      _ => null,
+    };
+    return objectText == null
+        ? content
+        : SelectableObjectBlock(
+            documentOrder: docOrderOf(node),
+            chunkIndex: chunkIndex,
+            text: objectText.text,
+            copyText: objectText.copy,
+            child: content,
+          );
   }
 
   /// 段落渲染 — InlineSpanText 自动管 GestureRecognizer 生命周期。
@@ -324,13 +370,14 @@ class NodeFactory {
     // image-only 段落(全是 ImageRun / LineBreakRun,无真文字)用更小的
     // vertical padding。否则文本 margin 叠加 image 自身上下 padding,
     // 与前后段距离过大,跟 fwfh margin-collapsing 行为差距明显。
-    final isImageOnly = node.inlines.isNotEmpty &&
+    final isImageOnly =
+        node.inlines.isNotEmpty &&
         node.inlines.every((n) => n is ImageRun || n is LineBreakRun);
     final vertical = compact
         ? 0.0
         : isImageOnly
-            ? 4.0
-            : em / 2;
+        ? 4.0
+        : em / 2;
     return Padding(
       padding: EdgeInsets.only(
         top: trimTop ? 0 : vertical,
@@ -430,10 +477,10 @@ class NodeFactory {
   /// **绘制**而非字体字形([ListMarkerDot],自带文本基线)→ 清晰、跨字体
   /// 一致、垂直对齐稳定。key 供测试辨识层级。
   static Key _ulMarkerKey(int depth) => switch (depth) {
-        0 => const ValueKey('ul_marker_disc'),
-        1 => const ValueKey('ul_marker_circle'),
-        _ => const ValueKey('ul_marker_square'),
-      };
+    0 => const ValueKey('ul_marker_disc'),
+    1 => const ValueKey('ul_marker_circle'),
+    _ => const ValueKey('ul_marker_square'),
+  };
 
   /// 构建悬挂 marker:有序 = 等宽数字 Text(nowrap,自然宽);无序 = 自绘形状。
   static Widget _buildMarker(
@@ -502,9 +549,7 @@ class NodeFactory {
     final item = list.items[index];
     final markerStyle = baseStyle.copyWith(
       height: 1.5,
-      fontFeatures: list.ordered
-          ? const [FontFeature.tabularFigures()]
-          : null,
+      fontFeatures: list.ordered ? const [FontFeature.tabularFigures()] : null,
     );
     final markerColor =
         markerStyle.color ?? Theme.of(context).colorScheme.onSurface;
@@ -518,14 +563,12 @@ class NodeFactory {
     if (blocks != null) {
       final first = blocks.first;
       final isHead = first is HeadingNode;
-      final blockMarkerStyle =
-          markerStyle.copyWith(height: isHead ? 1.2 : 1.5);
+      final blockMarkerStyle = markerStyle.copyWith(height: isHead ? 1.2 : 1.5);
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),
         child: HtmlListItem(
           textDirection: textDirection,
-          marker:
-              _buildMarker(list, index, blockMarkerStyle, markerColor),
+          marker: _buildMarker(list, index, blockMarkerStyle, markerColor),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -550,9 +593,7 @@ class NodeFactory {
           marker: _buildMarker(list, index, markerStyle, markerColor),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              for (final sub in children) buildList(context, sub),
-            ],
+            children: [for (final sub in children) buildList(context, sub)],
           ),
         ),
       );
@@ -718,10 +759,7 @@ class NodeFactory {
   ///
   /// 样式对齐 legacy:vertical padding 12 + 1px 高线 +
   /// `colorScheme.outlineVariant @ 0.5`(派生)。
-  Widget buildHorizontalRule(
-    BuildContext context,
-    HorizontalRuleNode node,
-  ) {
+  Widget buildHorizontalRule(BuildContext context, HorizontalRuleNode node) {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12),
@@ -824,7 +862,8 @@ class NodeFactory {
   /// 高度取一个 em(≈ 一个空 `<p>` 的 margin 贡献,实测对齐 fwfh:块间一个
   /// 空段落 ≈ +1em)。连续多个叠加成多行留白。纯 SizedBox,不参与选区。
   Widget buildBlankLine(BuildContext context, BlankLineNode node) {
-    final baseStyle = baseTextStyle ??
+    final baseStyle =
+        baseTextStyle ??
         Theme.of(context).textTheme.bodyMedium ??
         const TextStyle();
     return SizedBox(height: baseStyle.fontSize ?? 14);
@@ -843,7 +882,15 @@ class NodeFactory {
     // 整块 override:主项目按 node.language 决定是否整块接管(如 mermaid
     // 换成独立图表容器)。返回 null 走下面的默认代码块外壳。
     final custom = codeBlockBuilder?.call(context, node);
-    if (custom != null) return custom;
+    if (custom != null) {
+      return SelectableObjectBlock(
+        documentOrder: docOrderOf(node),
+        chunkIndex: chunkIndex,
+        text: node.code,
+        codeLanguage: node.language ?? '',
+        child: custom,
+      );
+    }
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final highlighter = codeBlockHighlighter ?? defaultCodeBlockHighlighter;
@@ -853,9 +900,7 @@ class NodeFactory {
       decoration: BoxDecoration(
         color: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(
-          color: scheme.outlineVariant.withValues(alpha: 0.5),
-        ),
+        border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.5)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -952,10 +997,7 @@ class NodeFactory {
                 // 话题引用(cooked 无 data-username)不显示 "用户名:";
                 // 仅用户引用(有 username)才显示,对齐网页。
                 if (node.username.isNotEmpty)
-                  Text(
-                    '${node.username}:',
-                    style: usernameStyle,
-                  ),
+                  Text('${node.username}:', style: usernameStyle),
                 if (node.titleInlines.isNotEmpty) ...[
                   const SizedBox(width: 4),
                   Expanded(
@@ -1009,10 +1051,7 @@ class NodeFactory {
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
               child: DefaultTextStyle.merge(
-                style: TextStyle(
-                  color: scheme.onSurfaceVariant,
-                  height: 1.5,
-                ),
+                style: TextStyle(color: scheme.onSurfaceVariant, height: 1.5),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -1150,10 +1189,7 @@ class NodeFactory {
     Widget bodyWidget = Padding(
       padding: EdgeInsets.fromLTRB(12, isFirst ? 8 : 0, 12, isLast ? 12 : 0),
       child: DefaultTextStyle.merge(
-        style: TextStyle(
-          color: scheme.onSurfaceVariant,
-          height: 1.5,
-        ),
+        style: TextStyle(color: scheme.onSurfaceVariant, height: 1.5),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -1177,9 +1213,7 @@ class NodeFactory {
       margin: EdgeInsets.only(top: isFirst ? 8 : 0, bottom: isLast ? 8 : 0),
       decoration: BoxDecoration(
         color: config.color.withValues(alpha: 0.1),
-        border: Border(
-          left: BorderSide(color: config.color, width: 4),
-        ),
+        border: Border(left: BorderSide(color: config.color, width: 4)),
         borderRadius: BorderRadius.only(
           topRight: isFirst ? const Radius.circular(4) : Radius.zero,
           bottomRight: isLast ? const Radius.circular(4) : Radius.zero,
@@ -1267,11 +1301,9 @@ class NodeFactory {
         builder: (context, constraints) {
           const spacing = 6.0;
           final cols = gridColumnCount(node.images.length, node.columns);
-          final colWidth =
-              (constraints.maxWidth - (cols - 1) * spacing) / cols;
+          final colWidth = (constraints.maxWidth - (cols - 1) * spacing) / cols;
           final columns = distributeGridImages(node.images, cols);
-          final heights =
-              gridEqualizedTileHeights(columns, colWidth, spacing);
+          final heights = gridEqualizedTileHeights(columns, colWidth, spacing);
 
           return Row(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -1285,8 +1317,7 @@ class NodeFactory {
                       for (var r = 0; r < columns[c].length; r++)
                         Padding(
                           padding: EdgeInsets.only(
-                            bottom:
-                                r == columns[c].length - 1 ? 0 : spacing,
+                            bottom: r == columns[c].length - 1 ? 0 : spacing,
                           ),
                           child: _GridTile(
                             image: columns[c][r].$2,
@@ -1324,9 +1355,7 @@ class NodeFactory {
     // Flutter 层被吸收、不反复穿透到平台 view;RepaintBoundary 隔离重绘。
     // 平台 view 的真实交互(播放控制 / webview)走 OS 层,不受影响。
     if (custom != null) {
-      return RepaintBoundary(
-        child: MouseRegion(opaque: true, child: custom),
-      );
+      return RepaintBoundary(child: MouseRegion(opaque: true, child: custom));
     }
     return _LazyVideoThumbnailCard(
       node: node,
@@ -1353,9 +1382,7 @@ class NodeFactory {
     // Flutter 层被吸收、不反复穿透到平台 view;RepaintBoundary 隔离重绘。
     // 平台 view 的真实交互(播放控制 / webview)走 OS 层,不受影响。
     if (custom != null) {
-      return RepaintBoundary(
-        child: MouseRegion(opaque: true, child: custom),
-      );
+      return RepaintBoundary(child: MouseRegion(opaque: true, child: custom));
     }
     return _IframePlaceholderCard(
       node: node,
@@ -1380,9 +1407,7 @@ class NodeFactory {
     // Flutter 层被吸收、不反复穿透到平台 view;RepaintBoundary 隔离重绘。
     // 平台 view 的真实交互(播放控制 / webview)走 OS 层,不受影响。
     if (custom != null) {
-      return RepaintBoundary(
-        child: MouseRegion(opaque: true, child: custom),
-      );
+      return RepaintBoundary(child: MouseRegion(opaque: true, child: custom));
     }
     return _VideoPlaceholderCard(
       node: node,
@@ -1515,12 +1540,18 @@ class NodeFactory {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.image_outlined,
-                size: 28, color: scheme.onSurfaceVariant),
+            Icon(
+              Icons.image_outlined,
+              size: 28,
+              color: scheme.onSurfaceVariant,
+            ),
             const SizedBox(height: 4),
-            Text('SVG',
-                style: theme.textTheme.labelSmall
-                    ?.copyWith(color: scheme.onSurfaceVariant)),
+            Text(
+              'SVG',
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
           ],
         ),
       ),
@@ -1530,11 +1561,11 @@ class NodeFactory {
 
 /// 懒加载视频品牌色(对齐 legacy `_LazyVideoAttributes.brandColor`)。
 Color _brandColorFor(LazyVideoProvider p) => switch (p) {
-      LazyVideoProvider.youtube => const Color(0xFFFF0000),
-      LazyVideoProvider.vimeo => const Color(0xFF1AB7EA),
-      LazyVideoProvider.tiktok => const Color(0xFF010101),
-      LazyVideoProvider.other => const Color(0xFF666666),
-    };
+  LazyVideoProvider.youtube => const Color(0xFFFF0000),
+  LazyVideoProvider.vimeo => const Color(0xFF1AB7EA),
+  LazyVideoProvider.tiktok => const Color(0xFF010101),
+  LazyVideoProvider.other => const Color(0xFF666666),
+};
 
 /// 子包内置懒加载视频缩略图卡片(主项目不注入 lazyVideoBuilder 时的
 /// fallback)。
@@ -1569,7 +1600,8 @@ class _LazyVideoThumbnailCard extends StatelessWidget {
                           ? Image.network(
                               node.thumbnailUrl,
                               fit: BoxFit.cover,
-                              errorBuilder: (_, _, _) => const _VideoPlaceholder(),
+                              errorBuilder: (_, _, _) =>
+                                  const _VideoPlaceholder(),
                             )
                           : const _VideoPlaceholder(),
                     ),
@@ -1744,11 +1776,8 @@ class _SourceRow extends StatelessWidget {
             child: Image.network(
               faviconUrl!,
               fit: BoxFit.contain,
-              errorBuilder: (_, _, _) => Icon(
-                Icons.public,
-                size: 14,
-                color: scheme.onSurfaceVariant,
-              ),
+              errorBuilder: (_, _, _) =>
+                  Icon(Icons.public, size: 14, color: scheme.onSurfaceVariant),
             ),
           ),
           const SizedBox(width: 6),
@@ -1759,10 +1788,7 @@ class _SourceRow extends StatelessWidget {
               sourceName!,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 12,
-                color: scheme.onSurfaceVariant,
-              ),
+              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
             ),
           ),
       ],
@@ -1840,6 +1866,7 @@ class _Body extends StatelessWidget {
     );
   }
 }
+
 ///
 /// 设计跟 legacy `_CodeBlockWidget.build` 对齐(简化版,无 mermaid /
 /// 长按选择上下文):
@@ -1922,8 +1949,9 @@ class _CodeBlockBodyState extends State<_CodeBlockBody> {
           : Colors.black.withValues(alpha: 0.35),
     );
     final borderColor = scheme.outlineVariant.withValues(alpha: 0.3);
-    final thumbColor = (isDark ? Colors.white : Colors.black)
-        .withValues(alpha: 0.15);
+    final thumbColor = (isDark ? Colors.white : Colors.black).withValues(
+      alpha: 0.15,
+    );
 
     return SizedBox(
       key: _viewportKey,
@@ -1942,9 +1970,9 @@ class _CodeBlockBodyState extends State<_CodeBlockBody> {
             ),
             child: SelectionContainer.disabled(
               child: ScrollConfiguration(
-                behavior: ScrollConfiguration.of(context).copyWith(
-                  scrollbars: false,
-                ),
+                behavior: ScrollConfiguration.of(
+                  context,
+                ).copyWith(scrollbars: false),
                 child: SingleChildScrollView(
                   controller: _lineNumberVController,
                   physics: const NeverScrollableScrollPhysics(),
@@ -2055,8 +2083,7 @@ class _SpoilerBlockWidgetState extends State<_SpoilerBlockWidget>
   /// 点击处坐标 —— 揭开涟漪的圆心(onTapDown 采集,onTap 时启动动画)。
   Offset _tapDownPosition = Offset.zero;
 
-  void _onTap() =>
-      revealSpoiler(_tapDownPosition, context.size ?? Size.zero);
+  void _onTap() => revealSpoiler(_tapDownPosition, context.size ?? Size.zero);
   @override
   void dispose() {
     disposeSpoilerTicker();
@@ -2175,10 +2202,7 @@ class _QuoteTitle extends StatelessWidget {
       style: style,
     );
     if (onTap == null) return textWidget;
-    return GestureDetector(
-      onTap: onTap,
-      child: textWidget,
-    );
+    return GestureDetector(onTap: onTap, child: textWidget);
   }
 }
 
@@ -2202,11 +2226,7 @@ Color? _hexColor(String? hex) {
 /// 底色/文字色来自 Discourse 的 `--category-badge-color` 变量;点击跳分类页。
 /// (图标 svg 暂略,先对齐彩色 + 名称这两个主视觉。)
 class _QuoteCategoryBadge extends StatelessWidget {
-  const _QuoteCategoryBadge({
-    required this.name,
-    this.color,
-    this.onTap,
-  });
+  const _QuoteCategoryBadge({required this.name, this.color, this.onTap});
 
   final String name;
 
@@ -2274,10 +2294,7 @@ class _CopyButtonState extends State<_CopyButton> {
     final scheme = Theme.of(context).colorScheme;
     return TextButton.icon(
       onPressed: _copy,
-      icon: Icon(
-        _copied ? Icons.check_rounded : Icons.copy_rounded,
-        size: 14,
-      ),
+      icon: Icon(_copied ? Icons.check_rounded : Icons.copy_rounded, size: 14),
       label: Text(
         _copied ? 'Copied' : 'Copy',
         style: const TextStyle(fontSize: 11),
@@ -2332,6 +2349,7 @@ class _DetailsWidget extends StatefulWidget {
 class _DetailsWidgetState extends State<_DetailsWidget>
     with SingleTickerProviderStateMixin {
   late bool _isOpen;
+
   /// 是否构建 body widget(展开中或动画进行中为 true)
   late bool _buildBody;
   late AnimationController _controller;
@@ -2350,9 +2368,10 @@ class _DetailsWidgetState extends State<_DetailsWidget>
     _controller.addStatusListener(_handleAnimationStatus);
     // 每个动画帧通知宿主:高度即将在本帧布局中变化(reverse 半场钉头部用)
     _controller.addListener(FoldShiftHook.notify);
-    _iconTurns = Tween<double>(begin: 0.0, end: 0.25).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
-    );
+    _iconTurns = Tween<double>(
+      begin: 0.0,
+      end: 0.25,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeInOut));
     _heightFactor = CurvedAnimation(
       parent: _controller,
       curve: Curves.easeInOut,
@@ -2612,9 +2631,7 @@ class _CalloutTitleRow extends StatelessWidget {
       children: [
         Icon(config.icon, size: 18, color: config.color),
         const SizedBox(width: 8),
-        Expanded(
-          child: titleWidget,
-        ),
+        Expanded(child: titleWidget),
         if (foldable)
           Icon(
             Icons.expand_more_rounded,
@@ -2669,13 +2686,11 @@ class _FoldableCalloutWidgetState extends State<_FoldableCalloutWidget>
     );
     // 同 _DetailsWidget:动画帧高度变化通知宿主(reverse 半场钉头部)
     _controller.addListener(FoldShiftHook.notify);
-    _iconTurns = Tween<double>(begin: 0.0, end: 0.5).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeIn),
-    );
-    _heightFactor = CurvedAnimation(
-      parent: _controller,
-      curve: Curves.easeIn,
-    );
+    _iconTurns = Tween<double>(
+      begin: 0.0,
+      end: 0.5,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeIn));
+    _heightFactor = CurvedAnimation(parent: _controller, curve: Curves.easeIn);
     if (_expanded) _controller.value = 1.0;
   }
 
@@ -2704,9 +2719,7 @@ class _FoldableCalloutWidgetState extends State<_FoldableCalloutWidget>
       margin: const EdgeInsets.symmetric(vertical: 8),
       decoration: BoxDecoration(
         color: config.color.withValues(alpha: 0.1),
-        border: Border(
-          left: BorderSide(color: config.color, width: 4),
-        ),
+        border: Border(left: BorderSide(color: config.color, width: 4)),
         borderRadius: const BorderRadius.only(
           topRight: Radius.circular(4),
           bottomRight: Radius.circular(4),
@@ -2723,9 +2736,7 @@ class _FoldableCalloutWidgetState extends State<_FoldableCalloutWidget>
                 children: [
                   Icon(config.icon, size: 18, color: config.color),
                   const SizedBox(width: 8),
-                  Expanded(
-                    child: widget.titleWidget,
-                  ),
+                  Expanded(child: widget.titleWidget),
                   RotationTransition(
                     turns: _iconTurns,
                     child: Icon(
@@ -2861,7 +2872,8 @@ class _VideoPlaceholderCard extends StatelessWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final hasPoster = node.poster != null && node.poster!.isNotEmpty;
-    final aspect = (node.width != null &&
+    final aspect =
+        (node.width != null &&
             node.height != null &&
             node.width! > 0 &&
             node.height! > 0)
@@ -2888,8 +2900,11 @@ class _VideoPlaceholderCard extends StatelessWidget {
                       errorBuilder: (_, _, _) => Container(
                         color: Colors.black,
                         child: const Center(
-                          child: Icon(Icons.movie_rounded,
-                              size: 48, color: Colors.white54),
+                          child: Icon(
+                            Icons.movie_rounded,
+                            size: 48,
+                            color: Colors.white54,
+                          ),
                         ),
                       ),
                     ),
@@ -2900,8 +2915,11 @@ class _VideoPlaceholderCard extends StatelessWidget {
                         color: Colors.black.withValues(alpha: 0.55),
                         borderRadius: BorderRadius.circular(8),
                       ),
-                      child: const Icon(Icons.play_arrow_rounded,
-                          color: Colors.white, size: 32),
+                      child: const Icon(
+                        Icons.play_arrow_rounded,
+                        color: Colors.white,
+                        size: 32,
+                      ),
                     ),
                   ],
                 ),
@@ -2928,8 +2946,11 @@ class _VideoPlaceholderCard extends StatelessWidget {
             ),
             child: Row(
               children: [
-                Icon(Icons.play_circle_outline_rounded,
-                    size: 24, color: scheme.onSurfaceVariant),
+                Icon(
+                  Icons.play_circle_outline_rounded,
+                  size: 24,
+                  color: scheme.onSurfaceVariant,
+                ),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
@@ -2941,8 +2962,11 @@ class _VideoPlaceholderCard extends StatelessWidget {
                     ),
                   ),
                 ),
-                Icon(Icons.chevron_right_rounded,
-                    size: 18, color: scheme.onSurfaceVariant),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: 18,
+                  color: scheme.onSurfaceVariant,
+                ),
               ],
             ),
           ),
@@ -2982,8 +3006,11 @@ class _AudioPlaceholderCard extends StatelessWidget {
             ),
             child: Row(
               children: [
-                Icon(Icons.audiotrack_rounded,
-                    size: 22, color: scheme.onSurfaceVariant),
+                Icon(
+                  Icons.audiotrack_rounded,
+                  size: 22,
+                  color: scheme.onSurfaceVariant,
+                ),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
@@ -2995,8 +3022,11 @@ class _AudioPlaceholderCard extends StatelessWidget {
                     ),
                   ),
                 ),
-                Icon(Icons.chevron_right_rounded,
-                    size: 18, color: scheme.onSurfaceVariant),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: 18,
+                  color: scheme.onSurfaceVariant,
+                ),
               ],
             ),
           ),
@@ -3031,13 +3061,16 @@ class _TableWidget extends StatelessWidget {
     final totalWidth = columnWidths.fold<double>(0, (s, w) => s + w) + 2;
 
     // 分离 header / body
-    final headerRow = node.hasHeader && node.rows.isNotEmpty ? node.rows.first : null;
+    final headerRow = node.hasHeader && node.rows.isNotEmpty
+        ? node.rows.first
+        : null;
     final bodyRows = node.hasHeader && node.rows.isNotEmpty
         ? node.rows.sublist(1)
         : node.rows;
 
     // 截图模式关掉行虚拟化 → 全渲染,避免离屏截图截断大表格。
-    final showInfoBar = bodyRows.length > _kTableVirtualizeThreshold &&
+    final showInfoBar =
+        bodyRows.length > _kTableVirtualizeThreshold &&
         !childFactory.screenshotMode;
 
     Widget bodyWidget;
@@ -3053,7 +3086,11 @@ class _TableWidget extends StatelessWidget {
         child: ListView.builder(
           itemCount: bodyRows.length,
           itemBuilder: (ctx, i) => _buildRow(
-            ctx, theme, bodyRows[i], columnWidths, borderColor,
+            ctx,
+            theme,
+            bodyRows[i],
+            columnWidths,
+            borderColor,
             isHeader: false,
             // 虚拟化分支下方有 infoBar,行永远不当 last;infoBar 自有
             // top border 作为分隔
@@ -3067,7 +3104,11 @@ class _TableWidget extends StatelessWidget {
         children: [
           for (var i = 0; i < bodyRows.length; i++)
             _buildRow(
-              context, theme, bodyRows[i], columnWidths, borderColor,
+              context,
+              theme,
+              bodyRows[i],
+              columnWidths,
+              borderColor,
               isHeader: false,
               isLastRow: i == bodyRows.length - 1,
             ),
@@ -3104,9 +3145,14 @@ class _TableWidget extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   if (headerRow != null)
-                    _buildRow(context, theme, headerRow, columnWidths,
-                        borderColor,
-                        isHeader: true),
+                    _buildRow(
+                      context,
+                      theme,
+                      headerRow,
+                      columnWidths,
+                      borderColor,
+                      isHeader: true,
+                    ),
                   bodyWidget,
                 ],
               ),
@@ -3129,8 +3175,7 @@ class _TableWidget extends StatelessWidget {
               builder: (context, constraints) => SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: ConstrainedBox(
-                  constraints:
-                      BoxConstraints(minWidth: constraints.maxWidth),
+                  constraints: BoxConstraints(minWidth: constraints.maxWidth),
                   child: Align(
                     alignment: tableAlign == TextAlign.right
                         ? Alignment.centerRight
@@ -3151,10 +3196,11 @@ class _TableWidget extends StatelessWidget {
   /// 大表格重 build(缓存失效的主题切换等)不再重复 rows×cols 次 layout。
   /// baseStyle 变化(字号/字体)时签名不匹配 → 重测。
   static final Expando<({TextStyle style, List<double> widths})>
-      _columnWidthsCache = Expando('tableColumnWidths');
+  _columnWidthsCache = Expando('tableColumnWidths');
 
   List<double> _computeColumnWidths(ThemeData theme) {
-    final baseStyle = childFactory.baseTextStyle ??
+    final baseStyle =
+        childFactory.baseTextStyle ??
         theme.textTheme.bodyMedium ??
         const TextStyle(fontSize: 14);
     final cached = _columnWidthsCache[node];
@@ -3284,9 +3330,7 @@ class _TableWidget extends StatelessWidget {
             buf.write(count);
           case MathInlineRun(:final latex):
             buf.write(r'$' + latex + r'$');
-          case ImageRun() ||
-                LineBreakRun() ||
-                FootnoteRefRun():
+          case ImageRun() || LineBreakRun() || FootnoteRefRun():
             break;
         }
       }
@@ -3333,17 +3377,13 @@ class _TableWidget extends StatelessWidget {
   }) {
     return Container(
       decoration: BoxDecoration(
-        color: isHeader
-            ? theme.colorScheme.surfaceContainerHighest
-            : null,
+        color: isHeader ? theme.colorScheme.surfaceContainerHighest : null,
         // 最后一行不画 bottom — 外层 Container 的 Border.all 已经有底边,
         // 否则会出现双线毛刺。header 因为下方必有 body/infoBar,需要保留
         // bottom 作为分隔。
         border: isLastRow
             ? null
-            : Border(
-                bottom: BorderSide(color: borderColor, width: 1),
-              ),
+            : Border(bottom: BorderSide(color: borderColor, width: 1)),
       ),
       // 无 IntrinsicHeight + stretch:原因见 _TableColumnDividerPainter。
       // 行高由最高 cell 自然撑开,cell 自身无装饰依赖等高拉伸。
@@ -3403,9 +3443,7 @@ class _TableWidget extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
-        border: Border(
-          top: BorderSide(color: borderColor, width: 1),
-        ),
+        border: Border(top: BorderSide(color: borderColor, width: 1)),
       ),
       child: Text(
         'Table · $totalRows rows',
@@ -3456,6 +3494,7 @@ class _TableColumnDividerPainter extends CustomPainter {
     return false;
   }
 }
+
 /// Discourse policy 区块 fallback 卡(主项目不注入 policyBuilder 时)。
 ///
 /// 视觉对齐 legacy `_PolicyWidget`:
@@ -3636,13 +3675,17 @@ class _ChatTranscriptFallbackCard extends StatelessWidget {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.tag_rounded,
-                      size: 14, color: scheme.onSurfaceVariant),
+                  Icon(
+                    Icons.tag_rounded,
+                    size: 14,
+                    color: scheme.onSurfaceVariant,
+                  ),
                   const SizedBox(width: 4),
                   Text(
                     node.channelName!,
-                    style: theme.textTheme.labelSmall
-                        ?.copyWith(color: scheme.onSurfaceVariant),
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),

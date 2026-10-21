@@ -3,11 +3,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:fluxdo_render/editor.dart';
 
 void main() {
-  // cfluxdo 分支没有上游 1aea4ee 的链接来源保真（标签等于网址的显式链接
-  // 会导出成裸链接），这里用和网址不同的标签。
   const url = 'https://github.com';
-  const label = 'GitHub';
-  const raw = '[$label]($url)';
+  const raw = '[$url]($url)';
 
   EditorState expandedLink() {
     final state = EditorState(
@@ -15,13 +12,14 @@ void main() {
         TextBlock(
           id: 'e_0',
           content: EditableTextContent(
-            text: label,
+            text: url,
             marks: const [
               MarkSpan(
                 start: 0,
-                end: label.length,
+                end: url.length,
                 kind: MarkKind.link,
                 attr: url,
+                isAutoLink: false,
               ),
             ],
           ),
@@ -71,10 +69,10 @@ void main() {
     );
     select(0, raw.length);
     expect(state.copySelectionAsMarkdown(), raw);
-    select(1, 1 + label.length);
-    expect(state.copySelectionAsMarkdown(), label);
+    select(1, 1 + url.length);
+    expect(state.copySelectionAsMarkdown(), url);
     select(0, 5);
-    expect(state.copySelectionAsMarkdown(), r'\[GitH');
+    expect(state.copySelectionAsMarkdown(), r'\[http');
   });
 
   test('修改展开态目标后导出保留新值，导出不消费撤销', () {
@@ -85,11 +83,11 @@ void main() {
       ),
     );
     state.insertText('/issues');
-    expect(state.exportMarkdown(), '[$label]($url/issues)');
+    expect(state.exportMarkdown(), '[$url]($url/issues)');
     state.undo();
     expect(state.exportMarkdown(), raw);
     state.redo();
-    expect(state.exportMarkdown(), '[$label]($url/issues)');
+    expect(state.exportMarkdown(), '[$url]($url/issues)');
   });
 
   test('WYSIWYG 字面 Markdown 不得在导出时重新解析', () {
@@ -97,7 +95,7 @@ void main() {
     addTearDown(state.dispose);
     expect(
       state.exportMarkdown(),
-      r'\[GitHub\](https://github.com)'
+      r'\[https://github.com\](https://github.com)'
       '\n\n'
       r'\*\*字面\*\*',
     );
