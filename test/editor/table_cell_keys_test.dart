@@ -12,6 +12,54 @@ import 'package:fluxdo_render/src/editor/widget/fluxdo_editor.dart';
 import 'package:fluxdo_render/src/parser/paragraph_parser.dart';
 
 void main() {
+  testWidgets('提交回声到达时保留下一单元格编辑和未提交内容', (tester) async {
+    var n = 0;
+    final blocks = blockNodesToDoc(ParagraphParser().parse(
+      '<p>正文</p><table><thead><tr><th>A</th><th>B</th></tr></thead></table>'), () => 'e_${n++}');
+    final state = EditorState(blocks: blocks);
+    addTearDown(state.dispose);
+    String? submitted;
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: SingleChildScrollView(
+      child: FluxdoEditor(state: state, onTableEdited: (_, md) => submitted = md),
+    ))));
+    await tester.tap(find.text('A'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(EditableText), '新A');
+    await tester.tap(find.text('B'));
+    await tester.pumpAndSettle();
+    expect(submitted, contains('新A'));
+    await tester.enterText(find.byType(EditableText), '正在写B');
+    final updated = blockNodesToDoc(ParagraphParser().parse(
+      '<table><thead><tr><th>新A</th><th>B</th></tr></thead></table>'), () => 'r_${n++}');
+    final table = updated.first as dynamic;
+    state.updateIslandNode(blocks[1].id, table.node);
+    await tester.pumpAndSettle();
+    expect(find.byType(EditableText), findsOneWidget);
+    final field = tester.widget<EditableText>(find.byType(EditableText));
+    expect(field.controller.text, '正在写B');
+    expect(field.focusNode.hasFocus, true);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('新插入表格请求编辑后直接聚焦首格', (tester) async {
+    var n = 0;
+    final state = EditorState(blocks: blockNodesToDoc(
+      ParagraphParser().parse('<p>正文</p><table><tbody><tr><td>首格</td><td>次格</td></tr></tbody></table>'),
+      () => 'e_${n++}'));
+    addTearDown(state.dispose);
+    state.requestIslandEdit(state.blocks[1].id);
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: SingleChildScrollView(
+      child: FluxdoEditor(state: state, onTableEdited: (_, _) {}),
+    ))));
+    await tester.pump();
+    await tester.pump();
+    final field = tester.widget<EditableText>(find.byType(EditableText));
+    expect(field.controller.text, '首格');
+    expect(field.focusNode.hasFocus, true);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('cell 编辑中退格删字符(不被编辑器拦截)', (tester) async {
     var n = 0;
     final state = EditorState(
@@ -38,11 +86,11 @@ void main() {
     await tester.tap(find.text('ABC'));
     await tester.pump();
     await tester.pump(); // post-frame 焦点请求
-    final tf = find.byType(TextField);
+    final tf = find.byType(EditableText);
     expect(tf, findsOneWidget);
 
     // 光标移到末尾(取消全选),退格删一个字符
-    final controller = tester.widget<TextField>(tf).controller!;
+    final controller = tester.widget<EditableText>(tf).controller;
     controller.selection = TextSelection.collapsed(
         offset: controller.text.length);
     await tester.sendKeyEvent(LogicalKeyboardKey.backspace);
@@ -138,16 +186,13 @@ void main() {
     expect(state.selection?.extent.blockId, selBefore.extent.blockId,
         reason: '点 cell 不该触发编辑器 tap 选区兜底');
 
-    // primary focus 应在 cell TextField 内(编辑器 caret 依
+    // primary focus 应在 cell 编辑框内(编辑器 caret 依
     // hasPrimaryFocus 判定 → 此刻不绘制,无双光标)
     expect(
-      find.descendant(
-        of: find.byType(TextField),
-        matching: find.byWidgetPredicate(
-            (w) => w is EditableText && w.focusNode.hasPrimaryFocus),
-      ),
+      find.byWidgetPredicate(
+          (w) => w is EditableText && w.focusNode.hasPrimaryFocus),
       findsOneWidget,
-      reason: 'cell TextField 应持有 primary focus',
+      reason: 'cell 编辑框应持有 primary focus',
     );
     await tester.pump(const Duration(seconds: 1));
   });
